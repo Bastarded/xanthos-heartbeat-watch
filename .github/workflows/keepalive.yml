@@ -1,0 +1,95 @@
+# XANTHOS heartbeat-watch keepalive.
+#
+# WHY THIS FILE EXISTS: GitHub disables a public repo's scheduled workflows
+# after 60 days with no repository activity (verified 2026-09-22 against
+# docs.github.com/en/actions/using-workflows/events-that-trigger-workflows —
+# "scheduled workflows are automatically disabled when no repository activity
+# has occurred in 60 days"). A scheduled RUN does not count as activity; only a
+# real commit does. `heartbeat-watch.yml` never commits anything on its own, so
+# without this file the dead-man's switch would itself die silently, on the
+# one schedule nothing in this repo can observe.
+#
+# THE MECHANISM THIS RELIES ON IS INFERRED, NOT DOCUMENTED (flagged
+# 2026-09-22). Several widely-used community actions — gautamkrishnar/
+# keepalive-workflow, efrecon/gh-action-keepalive, PhrozenByte/
+# gh-workflow-immortality — commit with the default GITHUB_TOKEN specifically
+# to reset this clock, and their sustained popularity is strong circumstantial
+# evidence it works. But GitHub has not published that a GITHUB_TOKEN-authored
+# commit counts as "repository activity" for this purpose. If that inference
+# is wrong, this file fails exactly as silently as the problem it exists to
+# solve, and nothing on any schedule here would know for up to 60 days.
+#
+# THE BACKSTOP: a monthly ntfy push, sent whether or not the commit below
+# succeeds. Its absence — not its content — is the human-visible signal that
+# the inferred mechanism, or this workflow itself, has stopped working. That
+# is the one failure a commit-based fix cannot self-report.
+
+name: xanthos-heartbeat-keepalive
+
+on:
+  schedule:
+    # Monthly, well inside the 60-day window — wide margin for a missed or
+    # late run without risking the clock this exists to reset.
+    - cron: "0 0 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: heartbeat-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Touch the marker and commit — the thing that actually resets the clock
+        id: commit
+        run: |
+          set -uo pipefail
+          mkdir -p .github/keepalive
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keepalive/last-run.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive/last-run.txt
+          if git diff --cached --quiet; then
+            # The marker always changes (a fresh timestamp), so this branch is
+            # theoretical — but an --allow-empty fallback means a commit still
+            # lands even if that assumption is ever wrong.
+            git commit --allow-empty -m "keepalive: $(date -u +%Y-%m-%d) (no-op marker)"
+          else
+            git commit -m "keepalive: $(date -u +%Y-%m-%d)"
+          fi
+          if git push; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report to ntfy — sent either way, on purpose
+        run: |
+          set -uo pipefail
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "::error::NTFY_TOPIC is unset — the keepalive cannot report anything"
+            exit 1
+          fi
+
+          if [ "${{ steps.commit.outputs.pushed }}" = "true" ]; then
+            TITLE="XANTHOS heartbeat-watch keepalive: ok"
+            BODY="Monthly keepalive commit pushed $(date -u +%Y-%m-%d). The GITHUB_TOKEN-commit mechanism is inferred, not documented — this push is the real proof the repo is still alive. A missing push next month is the signal to check by hand, not silence."
+            PRIORITY="default"
+          else
+            TITLE="XANTHOS heartbeat-watch keepalive: PUSH FAILED"
+            BODY="The keepalive commit did not push $(date -u +%Y-%m-%d). The 60-day clock may not have reset. Check the repo by hand."
+            PRIORITY="high"
+          fi
+
+          curl -sS -m 20 -H "Title: $TITLE" -H "Priority: $PRIORITY" -d "$BODY" \
+            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null \
+            || { echo "::error::ntfy push failed — keepalive ran but could not report it"; exit 1; }

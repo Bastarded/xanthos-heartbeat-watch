@@ -1,0 +1,157 @@
+# XANTHOS off-box heartbeat watcher.
+#
+# WHY THIS REPO IS NOT XANTHOS: this workflow watches the laptop. XANTHOS's only
+# runner IS the laptop (self-hosted, and broken since 2026-09-16). A watcher that
+# lives there shares fate with the thing it watches, which is the one property it
+# must not have. Hence: separate repo, ubuntu-latest, GitHub-hosted.
+#
+# WHAT IT READS: a secret gist the engine PATCHes once a minute from
+# `scripts/lib/heartbeatPing.ts`. Anonymous read of a secret gist by id returns
+# 200 with inline content — measured 2026-09-22, not assumed. So this repo holds
+# NO GitHub credential.
+#
+# WHY THE GIST ID IS A SECRET AND NOT A LITERAL: for a secret gist the id IS the
+# read credential — anyone holding it can read this box's liveness state. This
+# repo is public (private-repo Actions minutes will not cover 4 runs/hour), so a
+# literal id here would quietly convert a secret gist into a public one. Both
+# values below are repo secrets; neither is a GitHub credential.
+#
+# THE TRAP THIS FILE EXISTS TO AVOID: never read `updated_at`. A PATCH with
+# byte-identical content is a no-op on GitHub's side and does not move that
+# field. The payload's own `ts` is the only honest liveness signal, and a missing
+# `ts` is treated here as a LOUD failure rather than a healthy default, because a
+# future edit dropping it would otherwise reintroduce the trap silently.
+#
+# ── THE 60-DAY TRAP (VERIFIED 2026-09-22, NOT A BELIEF) ───────────────────────
+# GitHub disables scheduled workflows in a public repo after 60 days with no
+# repository activity, and a scheduled RUN DOES NOT COUNT as activity — only real
+# commits reset the clock. A watcher repo never gets commits by nature, so this
+# would fire, silently and guaranteed. `keepalive.yml` in this repo is the
+# mitigation. Note this watcher cannot detect its own disablement BY
+# CONSTRUCTION — the same fate-sharing problem one level up — which is why the
+# keepalive carries a monthly "watcher alive" push as a human-visible backstop.
+
+name: xanthos-heartbeat-watch
+
+on:
+  schedule:
+    # Every 15 min. GitHub cron runs late, sometimes by 10+ minutes; STALE_MIN is
+    # set well above the cadence so lateness is never mistaken for a dead box.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: heartbeat-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GIST_ID: ${{ secrets.HEARTBEAT_GIST_ID }}
+      GIST_FILE: xanthos-heartbeat.json
+      # Minutes of silence before the box is called gone. Engine pings every
+      # minute; this tolerates ~30 consecutive misses plus cron lateness. CHOSEN,
+      # not measured — revisit once it has fired for real once.
+      STALE_MIN: "30"
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+    steps:
+      - name: Read the heartbeat and decide
+        run: |
+          set -uo pipefail
+
+          push() {  # $1 = title, $2 = body
+            if [ -z "${NTFY_TOPIC:-}" ]; then
+              echo "::error::NTFY_TOPIC is unset — the watcher cannot report anything"
+              exit 1
+            fi
+            curl -sS -m 20 \
+              -H "Title: $1" -H "Priority: high" -H "Tags: rotating_light" \
+              -d "$2" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null \
+              || { echo "::error::ntfy push failed — the alert did not leave this runner"; exit 1; }
+          }
+
+          if [ -z "${GIST_ID:-}" ]; then
+            # Not a push: with no id there is nothing to read, and the topic may
+            # also be unset. Fail visibly in the Actions tab instead.
+            echo "::error::HEARTBEAT_GIST_ID secret is unset — nothing to watch"
+            exit 1
+          fi
+
+          # ── fetch, with retries, so one flaky call is not a false funeral ────
+          BODY=""
+          for i in 1 2 3; do
+            if BODY=$(curl -sS -m 20 -f "https://api.github.com/gists/${GIST_ID}"); then
+              break
+            fi
+            BODY=""
+            sleep $((i * 5))
+          done
+
+          if [ -z "$BODY" ]; then
+            # Distinct from a dead box on purpose: this is the WATCHER failing to
+            # see, not the engine failing to ping. Conflating them would teach
+            # the wrong lesson on the day it matters.
+            push "XANTHOS heartbeat UNREADABLE" \
+                 "Could not read the gist after 3 tries. This is a watcher-side fault (GitHub API or network), NOT proof the box is down. Check the box independently."
+            exit 1
+          fi
+
+          FILE=$(echo "$BODY" | jq -r --arg f "$GIST_FILE" '.files[$f] // empty')
+          if [ -z "$FILE" ]; then
+            push "XANTHOS heartbeat FILE MISSING" \
+                 "The gist has no file named ${GIST_FILE}. Either it was renamed or the engine is writing somewhere else."
+            exit 1
+          fi
+
+          TRUNC=$(echo "$FILE" | jq -r '.truncated // false')
+          if [ "$TRUNC" = "true" ]; then
+            # Measured at 57 bytes today, far under the inline limit — but a long
+            # `note` could cross it, and a truncated read would silently look
+            # like a missing ts. Go loud instead.
+            push "XANTHOS heartbeat TRUNCATED" \
+                 "Gist content came back truncated, so ts could not be trusted. Payload has grown past the inline limit — shorten the note or teach the watcher to follow raw_url."
+            exit 1
+          fi
+
+          CONTENT=$(echo "$FILE" | jq -r '.content // empty')
+          TS=$(echo "$CONTENT" | jq -r '.ts // empty' 2>/dev/null)
+          OK=$(echo "$CONTENT" | jq -r '.ok // empty' 2>/dev/null)
+          NOTE=$(echo "$CONTENT" | jq -r '.note // ""' 2>/dev/null)
+
+          if [ -z "$TS" ]; then
+            # THE REGRESSION GUARD. If `ts` ever leaves the payload, this fires
+            # rather than quietly falling back to metadata that lies.
+            push "XANTHOS heartbeat NO TIMESTAMP" \
+                 "Payload carries no ts field. Liveness cannot be judged from content and must NOT be judged from updated_at. Check heartbeatPing.ts."
+            exit 1
+          fi
+
+          EPOCH=$(date -u -d "$TS" +%s 2>/dev/null || echo "")
+          if [ -z "$EPOCH" ]; then
+            push "XANTHOS heartbeat BAD TIMESTAMP" \
+                 "ts present but unparseable: ${TS}"
+            exit 1
+          fi
+
+          AGE_MIN=$(( ( $(date -u +%s) - EPOCH ) / 60 ))
+          echo "ts=${TS} ok=${OK} note=${NOTE} age_min=${AGE_MIN}"
+
+          # ── gone outranks sick: a stale payload's `ok` is history, not news ──
+          if [ "$AGE_MIN" -gt "$STALE_MIN" ]; then
+            push "XANTHOS box GONE (${AGE_MIN}m silent)" \
+                 "No heartbeat for ${AGE_MIN} minutes (threshold ${STALE_MIN}). Last write ${TS}, last state ok=${OK}${NOTE:+, note=${NOTE}}. The engine pings every minute — this is the box, not the engine."
+            exit 1
+          fi
+
+          if [ "$OK" != "true" ]; then
+            push "XANTHOS engine SICK${NOTE:+: ${NOTE}}" \
+                 "Box is alive and pinging (${AGE_MIN}m ago) but reports ok=false${NOTE:+ — ${NOTE}}. Port down, or tape stale in session."
+            exit 1
+          fi
+
+          echo "healthy — last ping ${AGE_MIN}m ago, no push sent"
