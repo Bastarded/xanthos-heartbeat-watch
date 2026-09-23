@@ -34,6 +34,7 @@
 name: xanthos-heartbeat-watch
 
 on:
+  # RE-REGISTERED 2026-09-23 ~12:30Z: 0 scheduled runs in the ~3 h after arming (only workflow_dispatch ran), so this touch makes GitHub re-read the schedule.
   # ARMED 2026-09-23: the box (XANTHOS watchdog) writes the gist every minute (verified: 8 consecutive :02 revisions 07:35-07:42Z); worst-case stop-to-alert ~55+ min (STALE_MIN 30 + 15 min cadence + cron lateness); STALE_MIN is CHOSEN, not measured.
   # Every 15 min. GitHub cron runs late, sometimes by 10+ minutes; STALE_MIN is
   # set well above the cadence so lateness is never mistaken for a dead box.
