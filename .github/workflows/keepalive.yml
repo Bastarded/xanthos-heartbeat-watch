@@ -90,6 +90,18 @@ jobs:
             PRIORITY="high"
           fi
 
-          curl -sS -m 20 -H "Title: $TITLE" -H "Priority: $PRIORITY" -d "$BODY" \
-            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null \
-            || { echo "::error::ntfy push failed — keepalive ran but could not report it"; exit 1; }
+          # THE STATUS IS READ, NOT ASSUMED — and this is the worst place in the
+          # repo to get it wrong. This push IS the backstop: the whole point is
+          # that its ABSENCE is the signal. A bare `curl || echo error` exits 0 on
+          # a 404, so a rejected backstop would report itself delivered, and the
+          # one failure nothing else here can observe would go unobserved for 60
+          # days. Fixed 2026-09-22, after exactly this swallowed a GONE push.
+          CODE=$(curl -sS -m 20 -o /dev/null -w "%{http_code}" \
+                   -H "Title: $TITLE" -H "Priority: $PRIORITY" -d "$BODY" \
+                   "https://ntfy.sh/${NTFY_TOPIC}") \
+            || { echo "::error::ntfy push failed at the network layer — keepalive ran but could not report it"; exit 1; }
+          echo "ntfy responded ${CODE}"
+          case "$CODE" in
+            2*) ;;
+            *)  echo "::error::ntfy rejected the keepalive push with HTTP ${CODE} — the backstop did not arrive"; exit 1 ;;
+          esac

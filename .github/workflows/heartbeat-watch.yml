@@ -69,10 +69,23 @@ jobs:
               echo "::error::NTFY_TOPIC is unset — the watcher cannot report anything"
               exit 1
             fi
-            curl -sS -m 20 \
-              -H "Title: $1" -H "Priority: high" -H "Tags: rotating_light" \
-              -d "$2" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null \
-              || { echo "::error::ntfy push failed — the alert did not leave this runner"; exit 1; }
+            # THE STATUS IS READ, NOT ASSUMED. This used to be a bare `curl ... ||
+            # echo error`, which cannot work: without -f, curl exits 0 on a 404 or
+            # a 429, so the `||` branch only ever caught a network-layer fault and
+            # a REJECTED push read exactly like a delivered one. That is how the
+            # first GONE test (2026-09-22) reported success to the log and put
+            # nothing on the phone — a guard that could not fail, believed.
+            # The status is echoed; the topic never is, because it is the credential.
+            local code
+            code=$(curl -sS -m 20 -o /dev/null -w "%{http_code}" \
+                     -H "Title: $1" -H "Priority: high" -H "Tags: rotating_light" \
+                     -d "$2" "https://ntfy.sh/${NTFY_TOPIC}") \
+              || { echo "::error::ntfy push failed at the network layer — the alert did not leave this runner"; exit 1; }
+            echo "ntfy responded ${code}"
+            case "$code" in
+              2*) ;;
+              *)  echo "::error::ntfy rejected the push with HTTP ${code} — the alert did not arrive"; exit 1 ;;
+            esac
           }
 
           if [ -z "${GIST_ID:-}" ]; then
