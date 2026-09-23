@@ -34,10 +34,29 @@
 name: xanthos-heartbeat-watch
 
 on:
-  schedule:
-    # Every 15 min. GitHub cron runs late, sometimes by 10+ minutes; STALE_MIN is
-    # set well above the cadence so lateness is never mistaken for a dead box.
-    - cron: "*/15 * * * *"
+  # ── SCHEDULE PARKED 2026-09-22, WITH THE CONDITION THAT RE-ARMS IT ──────────
+  # The engine cannot write to this gist yet — HEARTBEAT_GIST_TOKEN is unminted —
+  # so the only payload present is hand-written and goes stale within the hour.
+  # An armed schedule against a stale test payload fires GONE every 15 minutes,
+  # indefinitely, onto the same ntfy topic that carries the engine's real alerts.
+  # Guaranteed false positives, zero true positives, and a real
+  # stream_disconnected buried underneath them.
+  #
+  # RE-ARM CONDITION: the engine has written its first real ping — i.e.
+  # HEARTBEAT_GIST_ID and HEARTBEAT_GIST_TOKEN are set in XANTHOS's .env and
+  # `pingHeartbeat` has returned ok once. Then uncomment the two lines below.
+  # Until then this watcher is INERT and nothing is watching the box off-box.
+  #
+  # Parked here rather than with `gh workflow disable` deliberately: a disabled
+  # workflow is an invisible toggle whose re-arming depends on someone
+  # remembering, which is the exact failure this repo exists to not repeat. This
+  # is visible in the file, in git history, and carries its own trigger. It is
+  # also tracked in the XANTHOS operator queue, for the same reason.
+  #
+  # Every 15 min. GitHub cron runs late, sometimes by 10+ minutes; STALE_MIN is
+  # set well above the cadence so lateness is never mistaken for a dead box.
+  # schedule:
+  #   - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions: {}
